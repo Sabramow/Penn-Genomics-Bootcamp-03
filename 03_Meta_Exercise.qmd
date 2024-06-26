@@ -5,18 +5,227 @@ format: html
 
 # Load libraries
 ```{r}
+library(vroom)
+library(levinmisc)
+library(purrr)
+library(dplyr)
+library(tidyr)
 
+remotes::install_github("lcpilling/gwasRtools")
+library(gwasRtools)
+```
+
+# QC 
+
+Example of a QC check - calculate gc lambda
+
+```{r}
+calculate_lambda_gc <- function(df, PVALUE, EFF_ALL_FREQ, MAF_FILTER = FALSE, MAC_FILTER = FALSE) {
+  # Ensure that the 'PVALUE' column exists in the data frame
+  if (!"PVALUE" %in% names(df)) {
+    stop("The data frame must contain a 'PVALUE' column.")
+  }
+  
+  # Check for 'EFF_ALL_FREQ' column when MAF_FILTER is TRUE
+  if (MAF_FILTER && !"EFF_ALL_FREQ" %in% names(df)) {
+    stop("The data frame must contain an 'EFF_ALL_FREQ' column for MAF filtering.")
+  }
+  
+  # Apply MAF filter if MAF_FILTER is TRUE
+  if (MAF_FILTER) {
+    df <- df[df$EFF_ALL_FREQ > 0.01, ]
+  }
+  
+  # Check for 'CASE_MAC' column when MAC_FILTER is TRUE
+  if (MAC_FILTER && !"CASE_MAC" %in% names(df)) {
+    stop("The data frame must contain a 'CASE_MAC' column for Case MAC filtering.")
+  }
+  
+  # Apply CASE_MAC filter if MAC_FILTER is TRUE
+  if (MAC_FILTER) {
+    df <- df[df$CASE_MAC > 25, ]
+  }
+  
+  # Calculate the chi-squared values
+  chisq_FG_EUR <- qchisq(1 - df$PVALUE, 1)
+  
+  # Calculate lambda gc (λgc)
+  lambda_gc <- median(chisq_FG_EUR) / qchisq(0.5, 1)
+  
+  return(lambda_gc)
+}
 ```
 
 
-# QC Steps Here
+
+
+# MR-MEGA
+
+ Make new files
+This is an example of how to format binary outcome data in a way that works for both ML's wrapper, and can be directly used for MR-MEGA for binary outcome applications.
+Consider what this function does, and what you actually need to accomplish your goals.
+
+Format GWAS Inspector Output for MR-MEGA
 ```{r}
 
+inspect_to_mega <- function(infile, outfile) {
+  vroom::vroom(infile) %>%
+    mutate(
+    OR = exp(EFFECT),  # Calculate the Odds Ratio
+    OR_95L = exp(EFFECT - 1.96 * STDERR),  # Lower 95% CI
+    OR_95U = exp(EFFECT + 1.96 * STDERR), # Upper 95% CI
+    allele_count = (AF * N_TOTAL),
+    N_EFF = (4 / (1/N_CASE + 1/N_CONTROL))) %>% # Add effective sample size
+  filter(allele_count >=50) %>% 
+  select (MARKERNAME = varID, EA = EFFECT_ALL, NEA = OTHER_ALL, OR, OR_95L, OR_95U,  EAF = EFF_ALL_FREQ, N = N_EFF, CHROMOSOME = CHR, POSITION, EFFECT, STDERR, PVALUE) %>% 
+  drop_na() %>%
+  write_tsv(.,outfile)
+}
+
 ```
 
 
-# Running MR-MEGA
 ```{r}
-glimpse(mr_mega_out)
+mr_mega_list <- list.files("<path to formatted summary statistics>", full.names=TRUE)
+mr_mega_bin = "/project/voltron//Applications/MR-MEGA/MR-MEGA_v0.2/MR-MEGA" # Specific to LPC. For those using LPC, use this exact file path. 
 ```
+```{r}
+#Example
+output_mr_mega <-  mr_mega(
+  mr_mega_list,
+  mr_mega_bin,
+  marker_col = MARKERNAME,
+  chr_col = CHROMOSOME,
+  pos_col = POSITION,
+  effect_allele_col = EA,
+  other_allele_col = NEA,
+  eaf_col = EAF,
+  beta_col = EFFECT,
+  se_col = STDERR,
+  p_value_col = PVALUE,
+  n_pcs = 3) # "Default = 4. Please note that the PC count must be < cohort count - 2. Therefore, if five cohorts have been used in the analyse, then the maximum number of PC-s can be two!"
+```
+
+```{r}
+process_mrmega<- function(df) {
+  df %>%
+    mutate(p_value_association = pchisq(chisq_association, ndf_association, lower.tail = FALSE)) %>%
+    mutate(p_value_ancestry_het = pchisq(chisq_ancestry_het, ndf_ancestry_het, lower.tail = FALSE)) %>%
+    mutate(p_value_residual_het = pchisq(chisq_residual_het, ndf_residual_het, lower.tail = FALSE)) %>% 
+    filter(chromosome %in% 1:22) %>% 
+    annotate_rsids(chrom_col = chromosome, pos_col = position, dbSNP = SNPlocs.Hsapiens.dbSNP144.GRCh38::SNPlocs.Hsapiens.dbSNP144.GRCh38)
+  
+}
+
+# Lead variants
+extract_lead_loci_mega <- function(df, n_study_filter = 2, distance = 1000000, min_locus_snps = 2) {
+  df %>%
+    filter(p_value_association < 5e-8) %>%
+    filter(ncohort >= n_study_filter) %>%
+    mutate(chromosome = as.numeric(chromosome)) %>%
+    collect() %>%
+    tidygenomics::genome_cluster(by = c("chromosome", "position", "position"), max_distance = distance) %>%
+    add_count(cluster_id, name = "cluster_n") %>%
+    filter(cluster_n >= min_locus_snps) %>%
+    group_by(cluster_id) %>%
+    slice_min(p_value_association, with_ties = FALSE) %>%
+      mutate(signif_het_bonferroni = case_when(
+      p_value_ancestry_het < 0.05/nrow(.) ~ TRUE,
+      TRUE ~ FALSE
+    )) %>%
+    ungroup %>%
+    arrange(p_value_association) 
+}
+
+
+```
+
+### Find lead loci from MR-MEGA
+```{r}
+
+tophits_MR_MEGA <- output_mr_mega %>% 
+  process_mrmega() %>% 
+  extract_lead_loci_mega()
+```
+
+
+
+
+
+# METAL
+
+Example of running meta on all files
+```{r}
+all_meta_files <- list.files(
+  "<path to output folder from GWAS inspector",
+  pattern = "\\.txt\\.gz$",
+  full.names = TRUE
+)
+```
+
+```{r}
+metal_config(
+  config_name = "Your_name_here",
+  output_dir = "/project/damrauer_shared/Users/sabramow/CAD/METAL/Output_2024",
+  study_files = all_meta_files,
+  MARKERLABEL = "varID",
+  CHROMOSOMELABEL = "CHR",
+  POSITIONLABEL = "POSITION",
+  EFFECT_ALLELE = "EFFECT_ALL",
+  OTHER_ALLELE = "OTHER_ALL",
+  EFFECTLABEL = "EFFECT",
+  STDERR = "STDERR",
+  FREQLABEL = "EFF_ALL_FREQ",
+  NCASE = "N_CASE",
+  NCONTROL = "N_CONTROL",
+  SAMPLESIZE = "N_TOTAL"
+  
+  )
+
+
+```
+
+```{r}
+# Keep metal_path the same
+metal_run(config_file = "path which is output by running the above code", metal_path = "/project/voltron/Applications/METAL/metal-2020-05-05")
+```
+
+
+#### Top hits METAL
+```{r}
+
+extract_lead_loci_metal <- function(df, distance = 1000000, min_locus_snps = 2) {
+  df %>%
+    collect() %>%
+    tidygenomics::genome_cluster(by = c("Chromosome", "Position", "Position"), max_distance = distance) %>%
+    add_count(cluster_id, name = "cluster_n") %>%
+    filter(cluster_n >= min_locus_snps) %>% 
+    group_by(cluster_id) %>%
+    slice_min(P.value, with_ties = FALSE) %>% 
+    ungroup()
+
+}
+```
+
+
+```{r}
+# This is just an example; to run faster, set ap value filter earlier in the code so you don't need to annotate everything
+top_hits_METAL <- df %>% 
+  filter(Chromosome %in% 1:22) %>% 
+  filter(P.value < 5e-8) %>% 
+  mutate_at(vars(Allele1, Allele2), toupper) %>% 
+  annotate_rsids(chrom_col = Chromosome, pos_col = Position, dbSNP = SNPlocs.Hsapiens.dbSNP144.GRCh38::SNPlocs.Hsapiens.dbSNP144.GRCh38) %>% 
+  extract_lead_loci_metal(.)
+  
+```
+
+
+# Manhattan Plotting and qq plots
+recommend gg_manhattan_df from levinmisc, or qqman package
+don't forget to specify build!
+```{r}
+
+
+```
+
 
