@@ -166,7 +166,7 @@ all_meta_files <- list.files(
 ```{r}
 metal_config(
   config_name = "Your_name_here",
-  output_dir = "/project/damrauer_shared/Users/sabramow/CAD/METAL/Output_2024",
+  output_dir = "<output>",
   study_files = all_meta_files,
   MARKERLABEL = "varID",
   CHROMOSOMELABEL = "CHR",
